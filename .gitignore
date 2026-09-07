@@ -1,0 +1,20 @@
+# ---- 凭据: 含真实账号/Redis 密码, 严禁提交! ----
+# 使用方式: cp bigqmt_client_config.yaml.example bigqmt_client_config.yaml
+#          然后填入自己的凭据 (或用 BIGQMT_* 环境变量注入)
+bigqmt_client_config.yaml
+bigqmt_signal_trader_client_config.py
+test_redis.py
+
+# ---- 构建产物 (xmake) ----
+build/
+.xmake/
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+
+# ---- 直接 g++ 编译的测试产物 (仓库用 xmake, 见 xmake.lua) ----
+*.o
+*.obj
+qmt_test
+resp_test

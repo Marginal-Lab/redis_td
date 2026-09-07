@@ -1,0 +1,21 @@
+# 配置模板 —— 复制为 bigqmt_client_config.yaml 后填入你自己的凭据。
+# 真实配置文件已被 .gitignore 排除, 不要修改本模板来存凭据。
+#
+# 格式说明: 本项目只实现扁平 YAML 子集, 每行一个 "key: value":
+#   - '#' 开头为整行注释; 值后面以空格开头的 '#' 视为行内注释
+#   - 值可为裸字符串 / "双引号"(支持 \n \t \\ \") / '单引号'('' 转义为 ')
+#   - 不解析嵌套块 / 列表 / 流式语法; 未知 key 会告警到 stderr
+#
+# 字段与 src/bigqmt.hpp 的 ClientConfig 一一对应, 缺省即用代码内建默认值。
+# 加载优先级: 内建默认值 < 本文件 < BIGQMT_* 环境变量
+# 路径可用环境变量 BIGQMT_CONFIG_FILE 覆盖 (默认 ./bigqmt_client_config.yaml)
+
+account_id: ""              # MiniQMT 资金账号, RPC 队列/事件频道的命名键
+
+redis_host: "127.0.0.1"     # Redis 桥服务地址
+redis_port: 6379            # Redis 端口
+redis_db: 0                 # Redis 库号 (SELECT)
+redis_username: ""          # Redis 用户名 (留空则只用密码 AUTH)
+redis_password: ""          # Redis 密码
+
+rpc_timeout_seconds: 30.0   # 单次 RPC 等待超时(秒); 超时抛 RpcTimeoutError
