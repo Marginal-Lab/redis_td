@@ -350,10 +350,12 @@ public:
 // ---------------------------------------------------------------------------
 // Client configuration.
 //
-// Built-in defaults below are only the last-resort fallback. Load order:
-//   1. from_yaml() reads the flat YAML file  (./bigqmt_client_config.yaml by
+// Load order (later wins):
+//   1. built-in defaults below -- deliberately credential-free, a committed
+//      binary must never carry real account/password material;
+//   2. from_yaml() reads the flat YAML file  (./bigqmt_client_config.yaml by
 //      default; override the path with BIGQMT_CONFIG_FILE);
-//   2. BIGQMT_* environment variables then override the file:
+//   3. BIGQMT_* environment variables then override the file:
 //      BIGQMT_ACCOUNT_ID BIGQMT_REDIS_HOST BIGQMT_REDIS_PORT BIGQMT_REDIS_DB
 //      BIGQMT_REDIS_USERNAME BIGQMT_REDIS_PASSWORD BIGQMT_RPC_TIMEOUT_SECONDS
 // (env wins over the file, the file wins over the built-ins: a committed
@@ -369,12 +371,12 @@ public:
 // ---------------------------------------------------------------------------
 
 struct ClientConfig {
-    std::string account_id = "00033133";
-    std::string redis_host = "43.142.244.92";
-    int redis_port = 8889;
-    int redis_db = 5;
+    std::string account_id;             // 留空则 call() 报错 (见 call_impl)
+    std::string redis_host = "127.0.0.1";
+    int redis_port = 6379;
+    int redis_db = 0;
     std::string redis_username;
-    std::string redis_password = "strong_pwd_123";
+    std::string redis_password;         // 留空则不 AUTH
     double rpc_timeout_seconds = 30.0;
 
     // Defaults overridden by BIGQMT_* environment variables only.
