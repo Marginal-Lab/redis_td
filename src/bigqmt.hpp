@@ -34,19 +34,6 @@
 namespace bigqmt {
 
 // ---------------------------------------------------------------------------
-// Constants (xtquant.xtconstant values the demo uses)
-// ---------------------------------------------------------------------------
-
-enum {
-    STOCK_BUY = 23,        // order_type: 买入
-    STOCK_SELL = 24,       // order_type: 卖出
-    FIX_PRICE = 11,        // price_type: 限价
-    ORDER_UNKNOWN = 255,   // order_status default
-    SECURITY_ACCOUNT = 2,  // account type code for "STOCK"
-    ACCOUNT_STATUS_ONLINE = 1,
-};
-
-// ---------------------------------------------------------------------------
 // Human-readable labels for console output.
 //
 // On the wire (and in XtOrder/XtTrade...) these fields stay plain numbers --
@@ -62,7 +49,7 @@ enum {
 // Python package does.
 // ---------------------------------------------------------------------------
 
-// 委托方向 order_type (STOCK_BUY/SELL 等; 融资融券同段代码区)
+// 委托方向 order_type (23 买入 / 24 卖出; 融资融券同段代码区)
 enum class OrderAction : long long {
     Buy = 23,                  // 买入 / 担保品买入
     Sell = 24,                 // 卖出 / 担保品卖出
@@ -107,6 +94,34 @@ enum class OrderStatus : long long {
     Junk = 57,            // 废单
     Unknown = 255,        // 未知
 };
+
+// 账户类型 account_type (xtconstant: STOCK=2, CREDIT=3)。客户端声明只当
+// 本地标签 —— RPC 请求只带 account_id, 类型不发给服务器; 服务器 ping 会
+// 回报真实类型 (见 note_server_account_type), 显示时以服务器为准。
+enum class AccountType : long long { Security = 2, Credit = 3 };
+
+inline const char* account_type_name(AccountType t) {
+    switch (t) {
+        case AccountType::Security: return "STOCK";
+        case AccountType::Credit: return "CREDIT";
+    }
+    return "STOCK";
+}
+
+// 配置字符串 -> 枚举: 只认 STOCK/CREDIT (大小写不敏感), 其余回落 STOCK。
+// 配置加载端已对未知值告警 (apply_env_overrides), 这里保持安静。
+inline AccountType account_type_from_name(const std::string& name) {
+    std::string up;
+    up.reserve(name.size());
+    for (char c : name) {
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+        up += c;
+    }
+    return up == "CREDIT" ? AccountType::Credit : AccountType::Security;
+}
+
+// 账户连接状态 (on_account_status 的 status)
+enum class AccountStatus : long long { Online = 1 };
 
 inline const char* order_type_label(long long v) {
     switch (v) {
@@ -197,8 +212,8 @@ private:
 struct XtOrder {
     std::string account_id;
     std::string stock_code;
-    long long order_type = 0;
-    long long order_status = ORDER_UNKNOWN;
+    OrderAction order_type = static_cast<OrderAction>(0);
+    OrderStatus order_status = OrderStatus::Unknown;
     long long order_volume = 0;
     long long traded_volume = 0;
     double price = 0.0;
@@ -210,8 +225,8 @@ struct XtOrder {
     std::string order_remark;
     long long order_time = 0;  // unix seconds
     std::string status_msg;
-    long long price_type = 0;
-    long long account_type = SECURITY_ACCOUNT;
+    StockPriceType price_type = static_cast<StockPriceType>(0);
+    AccountType account_type = AccountType::Security;
     std::string instrument_name;
     std::string secu_account;
     long long offset_flag = 0;
@@ -221,7 +236,7 @@ struct XtOrder {
 struct XtTrade {
     std::string account_id;
     std::string stock_code;
-    long long order_type = 0;
+    OrderAction order_type = static_cast<OrderAction>(0);
     std::string order_sysid;
     OrderId order_id;
     std::string trade_id;
@@ -233,7 +248,7 @@ struct XtTrade {
     std::string traded_at;
     std::string strategy_name;
     std::string order_remark;
-    long long account_type = SECURITY_ACCOUNT;
+    AccountType account_type = AccountType::Security;
     std::string instrument_name;
     std::string secu_account;
     double commission = 0.0;
@@ -276,10 +291,26 @@ struct XtOrderStockResponse {
     std::string error_msg;
 };
 
+// 撤单异步回报 (cancel_order_stock_async 的响应对象, 字段镜像 Python compat
+// 层 CompatObject)。注意: 回报的是"撤单请求是否被桥受理", 不是最终撤成 ——
+// MiniQMT XtCancelOrderResponse 契约: cancel_result=0 受理成功, 非零给出
+// 错误码和可读 error_msg。实际撤没撤成仍看委托状态事件 (51 已报待撤 ->
+// 53/54 已撤), RPC 异常则走 on_cancel_error。
+struct XtCancelOrderStockResponse {
+    std::string account_id;
+    long long seq = 0;
+    bool success = false;  // cancel_order_stock 返回 0 即为 true
+    long long cancel_result = -1;  // 0 = 已受理, -1 = 被拒绝
+    std::string error_msg;
+    std::string order_sysid;   // == order_id 参数 (合同编号原样)
+    std::string order_sys_id;  // Python compat 层的冗余别名, 一并镜像
+    OrderId order_id;          // 合同编号的 OrderId 形态 (全数字 -> int)
+};
+
 struct XtAccountStatus {
     std::string account_id;
     std::string account_type;
-    long long status = 0;
+    AccountStatus status = static_cast<AccountStatus>(0);
 };
 
 // Query results, mirroring the bridge server's snapshots / MiniQMT XtAsset.
@@ -334,17 +365,21 @@ public:
     virtual void on_order_stock_async_response(const XtOrderStockResponse& response) {
         (void)response;
     }
+    virtual void on_cancel_order_stock_async_response(
+        const XtCancelOrderStockResponse& response) {
+        (void)response;
+    }
     virtual void on_account_status(const XtAccountStatus& status) { (void)status; }
 };
 
 class StockAccount {
 public:
     StockAccount() = default;
-    StockAccount(std::string account_id, long long account_type_code)
+    StockAccount(std::string account_id, AccountType account_type_code = AccountType::Security)
         : account_id(std::move(account_id)), account_type_code(account_type_code) {}
 
     std::string account_id;
-    long long account_type_code = SECURITY_ACCOUNT;
+    AccountType account_type_code = AccountType::Security;
 };
 
 // ---------------------------------------------------------------------------
@@ -356,8 +391,9 @@ public:
 //   2. from_yaml() reads the flat YAML file  (./bigqmt_client_config.yaml by
 //      default; override the path with BIGQMT_CONFIG_FILE);
 //   3. BIGQMT_* environment variables then override the file:
-//      BIGQMT_ACCOUNT_ID BIGQMT_REDIS_HOST BIGQMT_REDIS_PORT BIGQMT_REDIS_DB
-//      BIGQMT_REDIS_USERNAME BIGQMT_REDIS_PASSWORD BIGQMT_RPC_TIMEOUT_SECONDS
+//      BIGQMT_ACCOUNT_ID BIGQMT_ACCOUNT_TYPE BIGQMT_REDIS_HOST
+//      BIGQMT_REDIS_PORT BIGQMT_REDIS_DB BIGQMT_REDIS_USERNAME
+//      BIGQMT_REDIS_PASSWORD BIGQMT_RPC_TIMEOUT_SECONDS
 // (env wins over the file, the file wins over the built-ins: a committed
 // binary can still be repointed without recompilation).
 //
@@ -372,6 +408,7 @@ public:
 
 struct ClientConfig {
     std::string account_id;             // 留空则 call() 报错 (见 call_impl)
+    std::string account_type = "STOCK"; // STOCK(普通) / CREDIT(信用); 本地标签
     std::string redis_host = "127.0.0.1";
     int redis_port = 6379;
     int redis_db = 0;
@@ -438,14 +475,31 @@ public:
     // MiniQMT semantics: returns a seq immediately; the outcome arrives via
     // on_order_stock_async_response / on_order_error (both carry the seq).
     long long order_stock_async(const StockAccount& account, const std::string& stock_code,
-                                long long order_type, long long order_volume,
-                                long long price_type, double price,
+                                OrderAction order_type, long long order_volume,
+                                StockPriceType price_type, double price,
                                 const std::string& strategy_name,
                                 const std::string& order_remark);
 
     // Block until every queued async order has been submitted and its
     // callback fired. False on timeout.
     bool wait_async_orders(double timeout_seconds = 10.0);
+
+    // 撤单 (MiniQMT cancel_order_stock 契约, 镜像 Python compat 层):
+    // order_id 传委托的 合同编号 (XtOrder.order_sysid 原样即可)。同步 RPC,
+    // 返回 0 = 桥已受理, -1 = 桥拒绝; 最终成败不看返回值, 而是经委托状态
+    // 事件 (51 已报待撤 -> 53/54 已撤) 或 on_cancel_error 回报。被拒原因
+    // (桥 CancelResult.message, 如 "cancel returned false") 打到 stderr。
+    long long cancel_order_stock(const StockAccount& account,
+                                 const std::string& order_id);
+
+    // MiniQMT cancel_order_stock_async 契约, 镜像 Python compat 层: 分配
+    // 并返回 seq, 内部同步执行撤单 RPC, 结果在函数返回前经
+    // on_cancel_order_stock_async_response 回报 (受理与否, success/
+    // cancel_result); RPC/协议异常不抛给调用方, 改走 on_cancel_error。
+    // 回报在调用方线程内触发 (python compat 的同步模拟即是如此, 无独立
+    // outcome 线程)。
+    long long cancel_order_stock_async(const StockAccount& account,
+                                       const std::string& order_id);
 
     // Generic synchronous RPC (ping, query_stock_positions, ...). Returns the
     // response "data" value; throws RpcServerRepliedError / RpcTimeoutError /
@@ -592,6 +646,12 @@ private:
     static std::string rpc_payload(const Json& request);  // "b64s:..." wire form
     Json call_impl(const std::string& method, const Json& params,
                    double timeout_seconds);  // caller holds cmd_mutex_
+    // cancel RPC with the bridge's own rejection reason extracted from the
+    // reply data (CancelResult.message and friends). Returns 0 = 受理 /
+    // -1 = 被拒, exactly like cancel_order_stock; *reason is filled only on
+    // rejection (empty when the bridge gave no message).
+    long long cancel_rpc(const StockAccount& account, const std::string& order_id,
+                         std::string* reason);
     void send_cmd(const std::vector<std::string>& argv);  // caller holds cmd_mutex_
     void expect_ok(const std::string& what);              // caller holds cmd_mutex_
 

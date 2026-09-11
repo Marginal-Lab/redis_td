@@ -53,6 +53,7 @@ namespace {
 // BIGQMT_* environment variables override whatever the caller loaded.
 void apply_env_overrides(ClientConfig& cfg) {
     cfg.account_id = env_str("BIGQMT_ACCOUNT_ID", cfg.account_id);
+    cfg.account_type = env_str("BIGQMT_ACCOUNT_TYPE", cfg.account_type);
     cfg.redis_host = env_str("BIGQMT_REDIS_HOST", cfg.redis_host);
     cfg.redis_port = static_cast<int>(env_int("BIGQMT_REDIS_PORT", cfg.redis_port));
     cfg.redis_db = static_cast<int>(env_int("BIGQMT_REDIS_DB", cfg.redis_db));
@@ -60,6 +61,24 @@ void apply_env_overrides(ClientConfig& cfg) {
     cfg.redis_password = env_str("BIGQMT_REDIS_PASSWORD", cfg.redis_password);
     cfg.rpc_timeout_seconds = env_double("BIGQMT_RPC_TIMEOUT_SECONDS",
                                          cfg.rpc_timeout_seconds);
+    // account_type: 规范化成大写, 只认 STOCK/CREDIT, 其余回落 STOCK 并告警
+    // (配置文件里拼错、大小写混写都不至于静默跑成别的账户类型标签)。
+    std::string up;
+    up.reserve(cfg.account_type.size());
+    for (char c : cfg.account_type) {
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+        up += c;
+    }
+    if (up.empty()) {
+        cfg.account_type = "STOCK";
+    } else if (up != "STOCK" && up != "CREDIT") {
+        std::fprintf(stderr, "[bigqmt] config: unknown account_type '%s', "
+                             "falling back to STOCK (expect \"STOCK\" or \"CREDIT\")\n",
+                     cfg.account_type.c_str());
+        cfg.account_type = "STOCK";
+    } else {
+        cfg.account_type = up;
+    }
 }
 
 std::string trim_ascii(const std::string& s) {
@@ -255,6 +274,8 @@ ClientConfig ClientConfig::from_yaml(const std::string& path) {
         const std::string& v = entry.second;
         if (k == "account_id") {
             cfg.account_id = v;
+        } else if (k == "account_type") {
+            cfg.account_type = v;
         } else if (k == "redis_host") {
             cfg.redis_host = v;
         } else if (k == "redis_port") {
@@ -445,14 +466,15 @@ std::string full_a_share_code(const std::string& code) {
 }
 
 // action ("BUY"/"SELL" from the server) -> MiniQMT order_type 23/24.
-long long action_to_order_type(const std::string& action) {
+// Returns 0 (as OrderAction) for anything unrecognized.
+OrderAction action_to_order_type(const std::string& action) {
     std::string text;
     for (char c : action) text += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    if (text == "BUY") return STOCK_BUY;
-    if (text == "SELL") return STOCK_SELL;
-    if (text == "23") return STOCK_BUY;   // server may echo the numeric form
-    if (text == "24") return STOCK_SELL;
-    return 0;
+    if (text == "BUY") return OrderAction::Buy;
+    if (text == "SELL") return OrderAction::Sell;
+    if (text == "23") return OrderAction::Buy;   // server may echo the numeric form
+    if (text == "24") return OrderAction::Sell;
+    return static_cast<OrderAction>(0);
 }
 
 }  // namespace
@@ -716,7 +738,7 @@ void BigQmtXtTrader::fire_account_status() {
         cb = callback_;
     }
     if (!cb) return;
-    // status=1 == ACCOUNT_STATUS_ONLINE (MiniQMT XtAccountStatus). The server
+    // status=1 == AccountStatus::Online (MiniQMT XtAccountStatus). The server
     // is authoritative about the account type; fall back to what the caller
     // declared, then "STOCK" (issue #103 parity).
     XtAccountStatus status;
@@ -724,7 +746,7 @@ void BigQmtXtTrader::fire_account_status() {
     status.account_type = server_account_type_.empty() ? declared_account_type_
                                                        : server_account_type_;
     if (status.account_type.empty()) status.account_type = "STOCK";
-    status.status = ACCOUNT_STATUS_ONLINE;
+    status.status = AccountStatus::Online;
     try {
         cb->on_account_status(status);
     } catch (const std::exception& e) {
@@ -753,9 +775,7 @@ int BigQmtXtTrader::connect() {
 int BigQmtXtTrader::subscribe(const StockAccount& account) {
     // The declared account type never travels to the server; it only labels
     // the synthesized account status when the server did not answer ping.
-    std::string declared;
-    if (account.account_type_code == SECURITY_ACCOUNT) declared = "STOCK";
-    if (!declared.empty()) declared_account_type_ = declared;
+    declared_account_type_ = account_type_name(account.account_type_code);
     if (config_.account_id.empty() && !account.account_id.empty()) {
         config_.account_id = account.account_id;
     }
@@ -858,7 +878,11 @@ XtOrder order_from_event(const std::string& account_id, const Json& e) {
     o.account_id = account_id;
     o.stock_code = full_a_share_code(e.member_string("stock_code"));
     o.order_type = action_to_order_type(e.member_string("action"));
-    o.order_status = e.member_int("status", e.member_int("order_status", ORDER_UNKNOWN));
+    o.order_status =
+        static_cast<OrderStatus>(e.member_int("status",
+                                              e.member_int("order_status",
+                                                           static_cast<long long>(
+                                                               OrderStatus::Unknown))));
     o.order_volume = e.member_int("volume", e.member_int("order_volume", 0));
     o.traded_volume = e.member_int("traded_volume", 0);
     o.price = e.member_double("price", 0.0);
@@ -879,8 +903,10 @@ XtOrder order_from_event(const std::string& account_id, const Json& e) {
         o.order_time = static_cast<long long>(e.member_double("created_at_ts", 0.0));
     }
     o.status_msg = e.member_string("status_msg");
-    o.price_type = e.member_int("price_type", 0);
-    o.account_type = e.member_int("account_type", SECURITY_ACCOUNT);
+    o.price_type = static_cast<StockPriceType>(e.member_int("price_type", 0));
+    o.account_type =
+        static_cast<AccountType>(e.member_int("account_type",
+                                              static_cast<long long>(AccountType::Security)));
     o.instrument_name = e.member_string("instrument_name");
     o.secu_account = e.member_string("secu_account");
     o.offset_flag = e.member_int("offset_flag", 0);
@@ -912,7 +938,9 @@ XtTrade trade_from_event(const std::string& account_id, const Json& e) {
     t.strategy_name = e.member_string("strategy_name");
     t.order_remark = e.member_string("user_order_id",
                                      e.member_string("remark", ""));
-    t.account_type = e.member_int("account_type", SECURITY_ACCOUNT);
+    t.account_type =
+        static_cast<AccountType>(e.member_int("account_type",
+                                              static_cast<long long>(AccountType::Security)));
     t.instrument_name = e.member_string("instrument_name");
     t.secu_account = e.member_string("secu_account");
     t.commission = e.member_double("commission", 0.0);
@@ -1168,8 +1196,8 @@ void BigQmtXtTrader::deliver_barrier_events(const BarrierEntry& entry) {
 
 long long BigQmtXtTrader::order_stock_async(const StockAccount& account,
                                             const std::string& stock_code,
-                                            long long order_type, long long order_volume,
-                                            long long price_type, double price,
+                                            OrderAction order_type, long long order_volume,
+                                            StockPriceType price_type, double price,
                                             const std::string& strategy_name,
                                             const std::string& order_remark) {
     long long seq = ++async_seq_;
@@ -1179,9 +1207,9 @@ long long BigQmtXtTrader::order_stock_async(const StockAccount& account,
     job.seq = seq;
     job.account = account;
     job.stock_code = stock_code;
-    job.order_type = order_type;
+    job.order_type = static_cast<long long>(order_type);  // wire side: plain code
     job.order_volume = order_volume;
-    job.price_type = price_type;
+    job.price_type = static_cast<long long>(price_type);
     job.price = price;
     job.strategy_name = strategy_name;
     job.order_remark = order_remark;
@@ -1713,6 +1741,125 @@ std::string BigQmtXtTrader::get_last_order_id(const StockAccount& account,
     if (data.is_string()) return data.as_string();
     if (data.is_number()) return std::to_string(data.as_int64(0));
     return data.is_null() ? "-1" : "";
+}
+
+long long BigQmtXtTrader::cancel_rpc(const StockAccount& account,
+                                     const std::string& order_id,
+                                     std::string* reason) {
+    // 镜像 xtquant_compat.cancel_order_stock_sysid: 桥端别名到 cancel_order,
+    // 按 合同编号 (order_sysid) 撤; Python 契约 0 成功 / -1 失败 (issue #113:
+    // 早期把 bool 当返回值的坑是 False == 0, 失败会被误判为成功)。
+    const std::string account_id = resolved_account_id(config_, account);
+    Json params = Json::make_object();
+    params.set("account_id", Json::make_string(account_id));
+    params.set("market", Json::make_string(""));
+    params.set("order_sysid", Json::make_string(order_id));
+    Json data = call("cancel_order_stock_sysid", std::move(params));
+    if (!data.is_object()) return -1;  // 意外形状按失败处理
+    // python: bool(data.get("success", data)) -- 有 success 字段取其值
+    // (null == False, 与 python bool(None) 一致), 没有则按整个 dict 的真值
+    // (非空 == 成功)。
+    const Json* s = data.get("success");
+    bool ok;
+    if (s) {
+        ok = !s->is_null() && s->as_bool(false);
+    } else {
+        ok = !data.object_items().empty();
+    }
+    if (!ok && reason) {
+        // 桥的取消结果对象 (CancelResult) 序列化后带 message 等键: 被拒
+        // 时把真实原因带回去 (例如 "cancel returned false", 或 settle 给出
+        // "cancel was not confirmed: order ... still status ...")。
+        static const char* const kReasonKeys[] = {"message", "error_msg", "error"};
+        for (const char* key : kReasonKeys) {
+            std::string why = data.member_string(key);
+            if (!why.empty()) {
+                *reason = std::move(why);
+                break;
+            }
+        }
+    }
+    return ok ? 0 : -1;
+}
+
+long long BigQmtXtTrader::cancel_order_stock(const StockAccount& account,
+                                             const std::string& order_id) {
+    std::string reason;
+    long long rc = cancel_rpc(account, order_id, &reason);
+    if (rc != 0 && !reason.empty()) {
+        // 契约返回值只有 0/-1 (与 python 一致), 被拒原因打到 stderr 便于
+        // 定位 (常见: 非交易时段 / 委托已不可撤 / 权限等)。
+        std::fprintf(stderr, "[bigqmt] cancel_order_stock 被拒 order_sysid=%s: %s\n",
+                     order_id.c_str(), reason.c_str());
+    }
+    return rc;
+}
+
+long long BigQmtXtTrader::cancel_order_stock_async(const StockAccount& account,
+                                                   const std::string& order_id) {
+    // 镜像 xtquant_compat.cancel_order_stock_async: seq 分配后同步执行撤单
+    // RPC (python compat 的"异步"就是同步撤单 + 返回前回调), 结果经
+    // on_cancel_order_stock_async_response 回报 (受理与否, 非最终撤成)。
+    long long seq = ++async_seq_;
+    long long rc = -1;
+    std::string reason;
+    try {
+        rc = cancel_rpc(account, order_id, &reason);
+    } catch (const std::exception& e) {
+        // RPC/协议异常不抛给调用方: 同 python 一样改走 on_cancel_error
+        // (error_id = getattr(exc, "errno", 0) == 0, 本实现异常无 errno)。
+        std::shared_ptr<XtQuantTraderCallback> cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = callback_;
+        }
+        if (cb) {
+            XtCancelError error;
+            error.error_id = 0;
+            error.error_msg = e.what();
+            error.order_sysid = order_id;
+            error.order_sys_id = order_id;
+            error.order_id = OrderId(order_id);
+            error.stock_code = "";
+            try {
+                cb->on_cancel_error(error);
+            } catch (const std::exception& ue) {
+                std::fprintf(stderr, "[bigqmt] user callback failed: on_cancel_error: %s\n",
+                             ue.what());
+            }
+        }
+        return seq;
+    }
+    const bool ok = rc == 0;
+    // 桥带了拒绝原因就用真实原因 (python compat 只有固定文案, 这里增强:
+    // cancel_result/-1 + 真实原因能直接定位问题)。
+    const std::string reject_msg =
+        reason.empty() ? "cancel_order_stock rejected by server" : reason;
+    std::shared_ptr<XtQuantTraderCallback> cb;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        cb = callback_;
+    }
+    if (cb) {
+        XtCancelOrderStockResponse response;
+        response.account_id = config_.account_id;
+        response.seq = seq;
+        response.success = ok;
+        response.cancel_result = ok ? 0 : -1;
+        response.error_msg = ok ? "" : reject_msg;
+        response.order_sysid = order_id;
+        response.order_sys_id = order_id;
+        response.order_id = OrderId(order_id);
+        try {
+            cb->on_cancel_order_stock_async_response(response);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                         "[bigqmt] user callback failed: "
+                         "on_cancel_order_stock_async_response: %s\n",
+                         e.what());
+        }
+    }
+    return seq;
 }
 
 }  // namespace bigqmt

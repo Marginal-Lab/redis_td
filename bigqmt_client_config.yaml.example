@@ -11,6 +11,8 @@
 # 路径可用环境变量 BIGQMT_CONFIG_FILE 覆盖 (默认 ./bigqmt_client_config.yaml)
 
 account_id: ""              # MiniQMT 资金账号, RPC 队列/事件频道的命名键
+account_type: "STOCK"       # STOCK(普通) / CREDIT(信用); 只作本地标签 —— RPC
+                            # 不带类型, 服务器 ping 回报的真实类型会覆盖显示
 
 redis_host: "127.0.0.1"     # Redis 桥服务地址
 redis_port: 6379            # Redis 端口

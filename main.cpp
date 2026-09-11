@@ -14,12 +14,16 @@
 //     并触发委托回报 / 成交回报 / 委托失败 / 撤单失败回调,
 //   - order_stock_async 经独立 worker 线程走 Redis RPC 提交, 由 outcome
 //     线程触发 on_order_stock_async_response / on_order_error (带 seq),
+//   - 演示撤单: 连下两笔限价单, 等回执拿到合同编号后按编号撤单, 受理与否
+//     经 on_cancel_order_stock_async_response 回报 (撤单回报), 实际撤成看
+//     委托状态事件 (51 已报待撤 -> 53/54 已撤), 失败看 on_cancel_error,
 //   - Ctrl-C 后调 trader.stop() 收尾 (Python 版按 KeyboardInterrupt 退出,
 //     daemon 线程随之消亡; 这里显式 stop 保证排队委托有界排空).
 
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -29,7 +33,7 @@
 using namespace bigqmt;
 
 // 与 MyCallback 一一对应: 委托回报 / 成交回报 / 委托失败 / 撤单失败 /
-// 异步下单回报 / 账户状态。
+// 异步下单回报 / 撤单回报 / 账户状态。
 class MyCallback : public XtQuantTraderCallback {
 public:
     void on_disconnected() override {
@@ -85,6 +89,17 @@ public:
                static_cast<long long>(response.seq), response.stock_code.c_str(),
                response.order_id.str().c_str(), response.order_sysid.c_str(),
                response.order_remark.c_str());
+        note_sysid(response.order_remark, response.order_sysid);
+    }
+
+    void on_cancel_order_stock_async_response(
+        const XtCancelOrderStockResponse& response) override {
+        printf("[callback] 撤单回报   seq=%lld success=%d cancel_result=%lld "
+               "order_sysid=%s order_id=%s error_msg=%s\n",
+               static_cast<long long>(response.seq), static_cast<int>(response.success),
+               static_cast<long long>(response.cancel_result),
+               response.order_sysid.c_str(), response.order_id.str().c_str(),
+               response.error_msg.c_str());
     }
 
     void on_account_status(const XtAccountStatus& status) override {
@@ -92,6 +107,25 @@ public:
                status.account_id.c_str(), status.account_type.c_str(),
                static_cast<long long>(status.status));
     }
+
+    // ---- 撤单测试辅助: 收集异步下单回执里的 remark -> 合同编号 ------------
+    // 回执经内部 outcome 线程触发, 主线程 wait_async_orders() 返回后调用
+    // sysid_for() 取数, 因此这里需要互斥保护。
+    std::string sysid_for(const std::string& remark) {
+        std::lock_guard<std::mutex> lock(sysid_mutex_);
+        auto it = sysid_by_remark_.find(remark);
+        return it == sysid_by_remark_.end() ? std::string() : it->second;
+    }
+
+private:
+    void note_sysid(const std::string& remark, const std::string& sysid) {
+        if (remark.empty() || sysid.empty()) return;
+        std::lock_guard<std::mutex> lock(sysid_mutex_);
+        sysid_by_remark_[remark] = sysid;
+    }
+
+    std::mutex sysid_mutex_;
+    std::map<std::string, std::string> sysid_by_remark_;
 };
 
 namespace {
@@ -125,10 +159,14 @@ int main() {
     auto callback = std::make_shared<MyCallback>();
     trader.register_callback(callback);
 
-    StockAccount acc(config.account_id, SECURITY_ACCOUNT);
-    printf("connecting with account_id=%s redis=%s:%d db=%d\n",
-           config.account_id.c_str(), config.redis_host.c_str(), config.redis_port,
-           config.redis_db);
+    // 账户类型来自配置 (STOCK/CREDIT, yaml 的 account_type 或环境变量
+    // BIGQMT_ACCOUNT_TYPE), 只作本地标签 —— RPC 请求只带 account_id, 服务器
+    // ping 回报的真实类型会覆盖显示 (见 on_account_status)。
+    StockAccount acc(config.account_id,
+                     account_type_from_name(config.account_type));
+    printf("connecting with account_id=%s account_type=%s redis=%s:%d db=%d\n",
+           config.account_id.c_str(), account_type_name(acc.account_type_code),
+           config.redis_host.c_str(), config.redis_port, config.redis_db);
 
     trader.connect();
     trader.subscribe(acc);
@@ -146,10 +184,52 @@ int main() {
         std::fprintf(stderr, "账户查询失败: %s\n", e.what());
     }
 
-    // 真实下单调用保持注释, 需要时取消注释即可:
-    auto seq = trader.order_stock_async(acc, "600654.SH", STOCK_BUY, 100,
-                                   FIX_PRICE, 2.95, "rpc_test", "备注");
-    printf("order_stock_async seq=%lld\n", seq);
+    // ---- 下单 + 撤单演示 ---------------------------------------------------
+    // 连下两笔同价限价单(价格低于现价通常不成交, 撤单才有意义; 若高于现价
+    // 会秒成, 撤单自然无效 —— 看事件输出即可判断)。每笔用 remark 区分,
+    // 回执里带合同编号, 之后按编号逐笔撤单。
+    // 撤单: cancel_order_stock_async 的回报回调里 cancel_result=0 只代表
+    // "桥已受理", 实际撤成看委托状态事件 (51 已报待撤 -> 53/54 已撤),
+    // 桥拒绝/RPC 异常看 [callback] 撤单失败。
+    // 第一笔普通买入作对照; 第二笔为融资买入。注意: 桥对 27 等两融类型
+    // 原样转发 passorder (不会悄悄降级成普通买入, 那是已知 bug 行为),
+    // 是否受理取决于账户的两融权限; 而事件/查询里的方向恒为 买入(23)/
+    // 卖出(24) —— 事件只带买卖侧, 不带两融细分 (python compat 同样),
+    // 确认是否按融资记账需查 QMT 客户端委托明细。
+    struct OrderSpec {
+        const char* remark;
+        OrderAction action;
+        long long volume;
+        double price;
+    };
+    static const OrderSpec kOrderSpecs[] = {
+        {"cancel_demo_1", OrderAction::Buy, 100, 3.01},
+        {"cancel_demo_2", OrderAction::CreditFinBuy, 200, 3.02},
+    };
+
+    for (const auto& s : kOrderSpecs) {
+        long long seq = trader.order_stock_async(acc, "159845.SZ", s.action, s.volume,
+                                                 StockPriceType::Fix, s.price,
+                                                 "rpc_test", s.remark);
+        printf("已提交下单 seq=%lld remark=%s 方向=%s(%lld)\n", seq, s.remark,
+               order_type_label(s.action), static_cast<long long>(s.action));
+    }
+    if (!trader.wait_async_orders(15.0)) {
+        std::fprintf(stderr, "下单回执超时, 跳过撤单\n");
+    } else {
+        for (const auto& s : kOrderSpecs) {
+            std::string sysid = callback->sysid_for(s.remark);
+            if (sysid.empty()) {
+                printf("跳过撤单 remark=%s (回执未带合同编号)\n", s.remark);
+                continue;
+            }
+            printf("发起撤单 remark=%s sysid=%s ...\n", s.remark, sysid.c_str());
+            // 撤单回报在函数返回前即经回调触发 (python compat 同步模拟,
+            // 期间阻塞在撤单 RPC 上)。
+            long long seq = trader.cancel_order_stock_async(acc, sysid);
+            printf("撤单调用已返回 remark=%s seq=%lld\n", s.remark, seq);
+        }
+    }
 
     printf("running... press Ctrl-C to exit\n");
     std::signal(SIGINT, on_signal);
